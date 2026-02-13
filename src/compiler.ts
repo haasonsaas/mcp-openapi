@@ -30,6 +30,7 @@ export function compileOperations(doc: Record<string, unknown>, serverOverride?:
       const mergedParameters = mergeParameters(pathParameters, operationParameters);
       const requestBody = normalizeRequestBody(operation.requestBody);
       const response = normalizeSuccessResponse(operation.responses);
+      const responseSchemasByStatus = normalizeResponseSchemasByStatus(operation.responses);
 
       const effectiveSecurity = normalizeSecurity(operation.security) ?? pathSecurity ?? globalSecurity;
       const authOptions = toAuthRequirements(effectiveSecurity, securitySchemes);
@@ -50,6 +51,7 @@ export function compileOperations(doc: Record<string, unknown>, serverOverride?:
         requestBodyContentType: requestBody?.contentType,
         responseContentType: response?.contentType,
         successResponseSchema: response?.schema,
+        responseSchemasByStatus,
         servers: resolvedServers,
         authOptions,
         annotations: buildAnnotations(method)
@@ -398,6 +400,22 @@ function normalizeSuccessResponse(value: unknown): { contentType?: string; schem
   return undefined;
 }
 
+function normalizeResponseSchemasByStatus(value: unknown): Record<string, JsonSchema> {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+
+  const out: Record<string, JsonSchema> = {};
+  const responses = value as Record<string, unknown>;
+  for (const [status, rawResponse] of Object.entries(responses)) {
+    const normalized = normalizeResponseContent(rawResponse);
+    if (normalized?.schema) {
+      out[status] = normalized.schema;
+    }
+  }
+  return out;
+}
+
 function normalizeResponseContent(value: unknown): { contentType?: string; schema?: JsonSchema } | undefined {
   if (!isObject(value)) {
     return undefined;
@@ -589,7 +607,9 @@ function getSecuritySchemes(doc: Record<string, unknown>): Record<string, Securi
       name,
       type: String(scheme.type),
       in: isValidIn(scheme.in) ? scheme.in : undefined,
-      scheme: typeof scheme.scheme === "string" ? scheme.scheme : undefined
+      scheme: typeof scheme.scheme === "string" ? scheme.scheme : undefined,
+      tokenUrl: typeof scheme.tokenUrl === "string" ? scheme.tokenUrl : undefined,
+      scopes: isObject(scheme.scopes) ? (scheme.scopes as Record<string, string>) : undefined
     };
   }
 

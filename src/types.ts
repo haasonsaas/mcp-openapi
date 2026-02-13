@@ -5,6 +5,8 @@ export interface SecurityScheme {
   type: string;
   in?: "query" | "header" | "cookie";
   scheme?: string;
+  tokenUrl?: string;
+  scopes?: Record<string, string>;
 }
 
 export interface AuthRequirement {
@@ -43,6 +45,7 @@ export interface OperationModel {
   requestBodyContentType?: string;
   responseContentType?: string;
   successResponseSchema?: JsonSchema;
+  responseSchemasByStatus?: Record<string, JsonSchema>;
   servers: string[];
   authOptions: AuthRequirement[];
   annotations?: ToolAnnotations;
@@ -59,6 +62,9 @@ export interface RuntimeOptions {
   timeoutMs: number;
   retries: number;
   retryDelayMs: number;
+  maxResponseBytes: number;
+  allowedHosts: string[];
+  maxConcurrency: number;
 }
 
 export interface PaginationSummary {

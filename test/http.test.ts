@@ -19,6 +19,24 @@ function createOperation(url: string, overrides?: Partial<OperationModel>): Oper
   };
 }
 
+async function withEnv(overrides: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(overrides)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+
+  try {
+    await fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 test("executeOperation paginates cursor-based responses", async () => {
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
@@ -144,12 +162,171 @@ test("executeOperation serializes deepObject query and form-url-encoded body", a
 });
 
 test("executeOperation supports oauth2 bearer token from env", async () => {
-  const previous = process.env.MCP_OPENAPI_OAUTH2_ACCESS_TOKEN;
-  process.env.MCP_OPENAPI_OAUTH2_ACCESS_TOKEN = "test-oauth-token";
+  await withEnv({ MCP_OPENAPI_OAUTH2_ACCESS_TOKEN: "test-oauth-token" }, async () => {
+    let authHeader = "";
+    const server = createServer((_req, res) => {
+      authHeader = String(_req.headers.authorization ?? "");
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ ok: true }));
+    });
 
-  let authHeader = "";
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+
+    const result = await executeOperation(
+      createOperation(baseUrl, {
+        authOptions: [{ schemes: [{ name: "oauth", type: "oauth2" }] }]
+      }),
+      { query: {} },
+      { timeoutMs: 5000, retries: 0, retryDelayMs: 5 }
+    );
+
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+
+    assert.equal(result.status, 200);
+    assert.equal(authHeader, "Bearer test-oauth-token");
+  });
+});
+
+test("executeOperation supports apiKey auth in header, query, and cookie", async () => {
+  await withEnv({ MCP_OPENAPI_API_KEY: "api-key-123" }, async () => {
+    let seenHeader = "";
+    let seenQuery = "";
+    let seenCookie = "";
+    const server = createServer((req, res) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      seenHeader = String(req.headers["x-api-key"] ?? "");
+      seenQuery = url.searchParams.get("api_key") ?? "";
+      seenCookie = String(req.headers.cookie ?? "");
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+
+    const result = await executeOperation(
+      createOperation(baseUrl, {
+        authOptions: [
+          {
+            schemes: [
+              { name: "x-api-key", type: "apiKey", in: "header" },
+              { name: "api_key", type: "apiKey", in: "query" },
+              { name: "api_cookie", type: "apiKey", in: "cookie" }
+            ]
+          }
+        ]
+      }),
+      { query: {} },
+      { timeoutMs: 5000, retries: 0, retryDelayMs: 5 }
+    );
+
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+
+    assert.equal(result.status, 200);
+    assert.equal(seenHeader, "api-key-123");
+    assert.equal(seenQuery, "api-key-123");
+    assert.match(seenCookie, /api_cookie=api-key-123/);
+  });
+});
+
+test("executeOperation supports bearer and basic auth", async () => {
+  await withEnv(
+    {
+      MCP_OPENAPI_BEARER_TOKEN: "bearer-token-1",
+      MCP_OPENAPI_BASIC_USERNAME: "alice",
+      MCP_OPENAPI_BASIC_PASSWORD: "secret"
+    },
+    async () => {
+      let authHeader = "";
+      const server = createServer((req, res) => {
+        authHeader = String(req.headers.authorization ?? "");
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ok: true }));
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, resolve));
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      const baseUrl = `http://127.0.0.1:${address.port}`;
+
+      const bearer = await executeOperation(
+        createOperation(baseUrl, {
+          authOptions: [{ schemes: [{ name: "auth", type: "http", scheme: "bearer" }] }]
+        }),
+        { query: {} },
+        { timeoutMs: 5000, retries: 0, retryDelayMs: 5 }
+      );
+      assert.equal(bearer.status, 200);
+      assert.equal(authHeader, "Bearer bearer-token-1");
+
+      const basic = await executeOperation(
+        createOperation(baseUrl, {
+          authOptions: [{ schemes: [{ name: "auth", type: "http", scheme: "basic" }] }]
+        }),
+        { query: {} },
+        { timeoutMs: 5000, retries: 0, retryDelayMs: 5 }
+      );
+      assert.equal(basic.status, 200);
+      assert.equal(authHeader, `Basic ${Buffer.from("alice:secret").toString("base64")}`);
+
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+    }
+  );
+});
+
+test("executeOperation supports oauth2 client credentials flow", async () => {
+  await withEnv(
+    {
+      MCP_OPENAPI_OAUTH2_ACCESS_TOKEN: undefined,
+      MCP_OPENAPI_OAUTH2_CLIENT_ID: "client-1",
+      MCP_OPENAPI_OAUTH2_CLIENT_SECRET: "client-secret"
+    },
+    async () => {
+      let tokenRequests = 0;
+      let authHeader = "";
+      const server = createServer(async (req, res) => {
+        const url = new URL(req.url ?? "/", "http://localhost");
+        if (req.method === "POST" && url.pathname === "/token") {
+          tokenRequests += 1;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify({ access_token: "oauth-from-token-endpoint", token_type: "bearer", expires_in: 3600 }));
+          return;
+        }
+
+        authHeader = String(req.headers.authorization ?? "");
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ok: true }));
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, resolve));
+      const address = server.address();
+      assert.ok(address && typeof address === "object");
+      const baseUrl = `http://127.0.0.1:${address.port}`;
+
+      const result = await executeOperation(
+        createOperation(baseUrl, {
+          authOptions: [{ schemes: [{ name: "oauth", type: "oauth2", tokenUrl: `${baseUrl}/token`, scopes: { read: "r" } }] }]
+        }),
+        { query: {} },
+        { timeoutMs: 5000, retries: 0, retryDelayMs: 5 }
+      );
+
+      await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+
+      assert.equal(result.status, 200);
+      assert.equal(tokenRequests, 1);
+      assert.equal(authHeader, "Bearer oauth-from-token-endpoint");
+    }
+  );
+});
+
+test("executeOperation enforces allowed hosts", async () => {
   const server = createServer((_req, res) => {
-    authHeader = String(_req.headers.authorization ?? "");
     res.setHeader("content-type", "application/json");
     res.end(JSON.stringify({ ok: true }));
   });
@@ -159,19 +336,12 @@ test("executeOperation supports oauth2 bearer token from env", async () => {
   assert.ok(address && typeof address === "object");
   const baseUrl = `http://127.0.0.1:${address.port}`;
 
-  const result = await executeOperation(
-    createOperation(baseUrl, {
-      authOptions: [{ schemes: [{ name: "oauth", type: "oauth2" }] }]
-    }),
-    { query: {} },
-    { timeoutMs: 5000, retries: 0, retryDelayMs: 5 }
+  await assert.rejects(
+    executeOperation(createOperation(baseUrl), { query: {} }, { timeoutMs: 5000, retries: 0, retryDelayMs: 5, allowedHosts: ["example.com"] }),
+    /Target host not allowed/
   );
 
   await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
-  process.env.MCP_OPENAPI_OAUTH2_ACCESS_TOKEN = previous;
-
-  assert.equal(result.status, 200);
-  assert.equal(authHeader, "Bearer test-oauth-token");
 });
 
 test("executeOperation respects cancellation signal", async () => {
