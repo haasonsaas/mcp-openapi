@@ -1,5 +1,17 @@
 export type JsonSchema = Record<string, unknown>;
 
+export interface LintDiagnostic {
+  level: "error" | "warning";
+  code: string;
+  message: string;
+  location?: string;
+}
+
+export interface CompileOptions {
+  strict?: boolean;
+  toolNameTemplate?: string;
+}
+
 export interface SecurityScheme {
   name: string;
   type: string;
@@ -34,6 +46,7 @@ export interface ToolAnnotations {
 export interface OperationModel {
   operationId: string;
   title?: string;
+  tags?: string[];
   method: string;
   pathTemplate: string;
   description: string;
@@ -65,6 +78,13 @@ export interface RuntimeOptions {
   maxResponseBytes: number;
   allowedHosts: string[];
   maxConcurrency: number;
+  allowToolPatterns: string[];
+  denyToolPatterns: string[];
+  allowedMethods: string[];
+  allowedPathPrefixes: string[];
+  responseTransformModule?: string;
+  sseMaxSessions: number;
+  sseSessionTtlMs: number;
 }
 
 export interface PaginationSummary {

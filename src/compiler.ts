@@ -1,8 +1,8 @@
-import type { AuthRequirement, JsonSchema, OperationModel, ParameterSpec, SecurityScheme, ToolAnnotations } from "./types.js";
+import type { AuthRequirement, CompileOptions, JsonSchema, OperationModel, ParameterSpec, SecurityScheme, ToolAnnotations } from "./types.js";
 
 const HTTP_METHODS = new Set(["get", "post", "put", "patch", "delete", "head", "options"]);
 
-export function compileOperations(doc: Record<string, unknown>, serverOverride?: string): Map<string, OperationModel> {
+export function compileOperations(doc: Record<string, unknown>, serverOverride?: string, options: CompileOptions = {}): Map<string, OperationModel> {
   const rootServers = getServerUrls(doc, serverOverride);
   const paths = (doc.paths ?? {}) as Record<string, unknown>;
   const globalSecurity = normalizeSecurity(doc.security);
@@ -25,7 +25,7 @@ export function compileOperations(doc: Record<string, unknown>, serverOverride?:
       }
 
       const operation = rawOperation as Record<string, unknown>;
-      const operationId = getOperationId(operation, method, pathTemplate, operations);
+      const operationId = getOperationId(operation, method, pathTemplate, operations, options.toolNameTemplate);
       const operationParameters = normalizeParameters(operation.parameters);
       const mergedParameters = mergeParameters(pathParameters, operationParameters);
       const requestBody = normalizeRequestBody(operation.requestBody);
@@ -40,6 +40,7 @@ export function compileOperations(doc: Record<string, unknown>, serverOverride?:
       const model: OperationModel = {
         operationId,
         title: typeof operation.summary === "string" ? operation.summary : undefined,
+        tags: Array.isArray(operation.tags) ? operation.tags.filter((x): x is string => typeof x === "string") : undefined,
         method: method.toUpperCase(),
         pathTemplate,
         description: String(operation.description ?? operation.summary ?? `${method.toUpperCase()} ${pathTemplate}`),
@@ -222,15 +223,29 @@ function getOperationId(
   operation: Record<string, unknown>,
   method: string,
   pathTemplate: string,
-  existing: Map<string, OperationModel>
+  existing: Map<string, OperationModel>,
+  toolNameTemplate?: string
 ): string {
   const rawId = typeof operation.operationId === "string" ? operation.operationId : undefined;
-  const fallback = `${method}_${pathTemplate}`
+  const pathName = `${method}_${pathTemplate}`
     .replace(/[{}]/g, "")
     .replace(/[^a-zA-Z0-9_-]+/g, "_")
     .replace(/^_+|_+$/g, "");
+  const tagName =
+    Array.isArray(operation.tags) && typeof operation.tags[0] === "string"
+      ? String(operation.tags[0]).replace(/[^a-zA-Z0-9_-]+/g, "_")
+      : "";
+  const fallback = pathName || "operation";
 
-  let id = normalizeToolName(rawId ?? (fallback || "operation"));
+  const template = typeof toolNameTemplate === "string" && toolNameTemplate.trim() ? toolNameTemplate : "{operationId}";
+  const renderedTemplate = template
+    .replaceAll("{operationId}", rawId ?? "")
+    .replaceAll("{method}", method)
+    .replaceAll("{path}", pathName)
+    .replaceAll("{tag}", tagName)
+    .trim();
+
+  let id = normalizeToolName(renderedTemplate || rawId || fallback);
   let i = 1;
   while (existing.has(id)) {
     i += 1;

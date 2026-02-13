@@ -669,7 +669,14 @@ function withRuntimeDefaults(runtime: RuntimeOptions | Partial<RuntimeOptions>):
     retryDelayMs: runtime.retryDelayMs ?? 500,
     maxResponseBytes: runtime.maxResponseBytes ?? 2_000_000,
     allowedHosts: runtime.allowedHosts ?? [],
-    maxConcurrency: runtime.maxConcurrency ?? 8
+    maxConcurrency: runtime.maxConcurrency ?? 8,
+    allowToolPatterns: runtime.allowToolPatterns ?? [],
+    denyToolPatterns: runtime.denyToolPatterns ?? [],
+    allowedMethods: runtime.allowedMethods ?? [],
+    allowedPathPrefixes: runtime.allowedPathPrefixes ?? [],
+    responseTransformModule: runtime.responseTransformModule,
+    sseMaxSessions: runtime.sseMaxSessions ?? 100,
+    sseSessionTtlMs: runtime.sseSessionTtlMs ?? 300_000
   };
 }
 

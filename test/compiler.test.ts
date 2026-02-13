@@ -118,3 +118,21 @@ test("compileOperations builds object outputSchema for non-object responses and 
   assert.equal(resultSchema.type, "array");
 });
 
+test("compileOperations supports tool name templates with collision handling", () => {
+  const doc = {
+    openapi: "3.0.3",
+    servers: [{ url: "https://api.example.com" }],
+    paths: {
+      "/users": {
+        get: { operationId: "listUsers", tags: ["users"], responses: { "200": { description: "ok" } } }
+      },
+      "/admins": {
+        get: { operationId: "listAdmins", tags: ["users"], responses: { "200": { description: "ok" } } }
+      }
+    }
+  } as Record<string, unknown>;
+
+  const ops = compileOperations(doc, undefined, { toolNameTemplate: "{tag}_{method}" });
+  const names = [...ops.keys()].sort();
+  assert.deepEqual(names, ["users_get", "users_get_2"]);
+});

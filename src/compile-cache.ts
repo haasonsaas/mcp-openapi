@@ -3,17 +3,22 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { compileOperations } from "./compiler.js";
 import { loadOpenApiDocument } from "./openapi.js";
-import type { OperationModel } from "./types.js";
+import type { CompileOptions, OperationModel } from "./types.js";
 
 interface CacheEntry {
   hash: string;
   operations: OperationModel[];
 }
 
-export async function loadFromCompileCache(specPath: string, serverUrl: string | undefined, cachePath: string): Promise<Map<string, OperationModel> | null> {
+export async function loadFromCompileCache(
+  specPath: string,
+  serverUrl: string | undefined,
+  cachePath: string,
+  options: CompileOptions = {}
+): Promise<Map<string, OperationModel> | null> {
   try {
     const doc = await loadOpenApiDocument(specPath);
-    const hash = computeHash({ doc, serverUrl });
+    const hash = computeHash({ doc, serverUrl, options });
     const raw = await readFile(resolve(cachePath), "utf8");
     const parsed = JSON.parse(raw) as CacheEntry;
     if (parsed.hash !== hash) {
@@ -26,16 +31,21 @@ export async function loadFromCompileCache(specPath: string, serverUrl: string |
   }
 }
 
-export async function compileWithCache(specPath: string, serverUrl: string | undefined, cachePath: string): Promise<Map<string, OperationModel>> {
-  const cached = await loadFromCompileCache(specPath, serverUrl, cachePath);
+export async function compileWithCache(
+  specPath: string,
+  serverUrl: string | undefined,
+  cachePath: string,
+  options: CompileOptions = {}
+): Promise<Map<string, OperationModel>> {
+  const cached = await loadFromCompileCache(specPath, serverUrl, cachePath, options);
   if (cached) {
     return cached;
   }
 
   const doc = await loadOpenApiDocument(specPath);
-  const operations = compileOperations(doc, serverUrl);
+  const operations = compileOperations(doc, serverUrl, options);
   const entry: CacheEntry = {
-    hash: computeHash({ doc, serverUrl }),
+    hash: computeHash({ doc, serverUrl, options }),
     operations: [...operations.values()]
   };
 

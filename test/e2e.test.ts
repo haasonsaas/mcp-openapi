@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema, ListToolsResultSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -90,6 +91,66 @@ test("OpenAPI spec becomes MCP tools and can be invoked", async () => {
     assert.equal(invalid.isError, true);
     assert.match(JSON.stringify(invalid.content), /Input validation failed \(Zod\)/);
 
+    await transport.close();
+  });
+});
+
+test("policy can deny tools by pattern", async () => {
+  await withApiServer(async (apiBase) => {
+    const client = new Client({ name: "mcp-openapi-policy-e2e", version: "0.1.0" }, { capabilities: {} });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [
+        "dist/server.js",
+        "--spec",
+        "test/fixtures/sample-openapi.yaml",
+        "--server-url",
+        apiBase,
+        "--deny-tools",
+        "post*"
+      ],
+      cwd: process.cwd(),
+      stderr: "pipe"
+    });
+
+    await client.connect(transport);
+    const result = await client.request(
+      { method: "tools/call", params: { name: "postEcho", arguments: { body: { message: "hello" } } } },
+      CallToolResultSchema
+    );
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.content), /Tool not allowed by policy/);
+    await transport.close();
+  });
+});
+
+test("response transform module can rewrite tool responses", async () => {
+  await withApiServer(async (apiBase) => {
+    const client = new Client({ name: "mcp-openapi-transform-e2e", version: "0.1.0" }, { capabilities: {} });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [
+        "dist/server.js",
+        "--spec",
+        "test/fixtures/sample-openapi.yaml",
+        "--server-url",
+        apiBase,
+        "--response-transform",
+        resolve("test/fixtures/response-transform.mjs")
+      ],
+      cwd: process.cwd(),
+      stderr: "pipe"
+    });
+
+    await client.connect(transport);
+    const result = await client.request(
+      { method: "tools/call", params: { name: "postEcho", arguments: { body: { message: "hello" } } } },
+      CallToolResultSchema
+    );
+    assert.equal(result.isError, false);
+    const structured = result.structuredContent as Record<string, unknown>;
+    assert.equal(structured.message, "hello");
+    assert.equal(structured.transformedBy, "postEcho");
     await transport.close();
   });
 });

@@ -18,10 +18,24 @@ OpenAPI 3.x to MCP server bridge in TypeScript.
   - AJV JSON Schema validation
   - Response schema validation by HTTP status
 - Typed TypeScript implementation
+- Strict lint mode for OpenAPI quality gates (`--strict`)
+- Configurable tool naming template (`--tool-name-template`)
+- Policy engine:
+  - allow/deny tool patterns
+  - allow methods/path prefixes
+  - allow hosts
+- Optional response transform hook (`--response-transform <module>`)
 - Multiple transports:
   - `stdio`
   - `streamable-http` (Hono)
   - `sse` (legacy compatibility transport)
+- Transport hardening:
+  - graceful shutdown
+  - SSE session caps/TTL
+- Observability:
+  - Prometheus metrics
+  - status counters
+  - latency histogram buckets
 - Built-in browser test clients:
   - `/test/streamable`
   - `/test/sse`
@@ -79,12 +93,16 @@ Endpoints:
 ```bash
 mcp-openapi --spec <openapi-file> [options]
 mcp-openapi init [dir]
+mcp-openapi generate --spec <openapi-file> [--out-dir ./generated]
 ```
 
 Options:
 
 - `--server-url <url>`
 - `--cache-path <file>`
+- `--out-dir <dir>`
+- `--strict`
+- `--tool-name-template <template>`
 - `--print-tools`
 - `--validate-spec`
 - `--transport stdio|streamable-http|sse`
@@ -96,6 +114,27 @@ Options:
 - `--max-response-bytes <n>`
 - `--max-concurrency <n>`
 - `--allow-hosts host1,host2`
+- `--allow-tools pattern1,pattern2`
+- `--deny-tools pattern1,pattern2`
+- `--allow-methods GET,POST`
+- `--allow-path-prefixes /v1,/public`
+- `--response-transform <module-path>`
+- `--sse-max-sessions <n>`
+- `--sse-session-ttl-ms <ms>`
+
+Template placeholders for `--tool-name-template`:
+- `{operationId}`
+- `{method}`
+- `{path}`
+- `{tag}`
+
+Response transform module example:
+
+```js
+export default function transform({ operation, response }) {
+  return { ...response.body, transformedBy: operation.operationId };
+}
+```
 
 ## Auth env vars
 

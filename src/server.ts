@@ -22,10 +22,12 @@ import {
 import { executeOperation } from "./http.js";
 import { STREAMABLE_TEST_HTML, SSE_TEST_HTML } from "./html.js";
 import { paginateWithCursor } from "./pagination.js";
-import { renderPrometheus, metrics } from "./metrics.js";
-import type { OperationModel, RuntimeOptions } from "./types.js";
+import { observeLatency, observeStatus, renderPrometheus, metrics } from "./metrics.js";
+import type { CompileOptions, OperationModel, RuntimeOptions } from "./types.js";
 import { zodFromJsonSchema } from "./zod-schema.js";
 import { compileWithCache } from "./compile-cache.js";
+import { lintOpenApiDocument } from "./lint.js";
+import { loadOpenApiDocument } from "./openapi.js";
 
 const require = createRequire(import.meta.url);
 const Ajv = require("ajv");
@@ -45,11 +47,13 @@ interface RuntimeState {
 }
 
 interface CliOptions {
-  command: "run" | "init";
+  command: "run" | "init" | "generate";
   initDir?: string;
+  generateDir?: string;
   specPath: string;
   serverUrl?: string;
   cachePath: string;
+  compile: CompileOptions;
   printTools: boolean;
   validateSpec: boolean;
   watchSpec: boolean;
@@ -59,6 +63,7 @@ interface CliOptions {
 }
 
 let inFlightCalls = 0;
+let responseTransform: ((ctx: { operation: OperationModel; response: { body: unknown; status: number } }) => unknown | Promise<unknown>) | undefined;
 
 async function main(): Promise<void> {
   const cli = parseArgs(process.argv.slice(2));
@@ -69,8 +74,20 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cli.command === "generate") {
+    const specPath = resolve(cli.specPath);
+    const state = await loadRuntimeState(specPath, cli.serverUrl, cli.cachePath, cli.compile);
+    await generateProjectFromSpec(cli.generateDir ?? resolve(process.cwd(), "generated-mcp-server"), specPath, state.operations, cli);
+    process.stderr.write(`Generated project in ${resolve(cli.generateDir ?? resolve(process.cwd(), "generated-mcp-server"))}\n`);
+    return;
+  }
+
   const specPath = resolve(cli.specPath);
-  const state: RuntimeState = await loadRuntimeState(specPath, cli.serverUrl, cli.cachePath);
+  const state: RuntimeState = await loadRuntimeState(specPath, cli.serverUrl, cli.cachePath, cli.compile);
+
+  if (cli.runtime.responseTransformModule) {
+    responseTransform = await loadResponseTransform(cli.runtime.responseTransformModule);
+  }
 
   if (cli.validateSpec) {
     process.stdout.write(`Spec valid. Compiled ${state.operations.size} tools.\n`);
@@ -135,6 +152,12 @@ function createMcpServer(state: RuntimeState, cli: CliOptions): Server {
     if (!operation) {
       throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${request.params.name}`);
     }
+    if (!isToolAllowed(operation, cli.runtime)) {
+      return {
+        content: [{ type: "text", text: JSON.stringify({ error: `Tool not allowed by policy: ${operation.operationId}` }, null, 2) }],
+        isError: true
+      };
+    }
 
     const inputZod = state.validators.inputsZod.get(operation.operationId);
     const inputAjv = state.validators.inputsAjv.get(operation.operationId);
@@ -187,9 +210,16 @@ function createMcpServer(state: RuntimeState, cli: CliOptions): Server {
         }
       });
 
-      metrics.toolCallLatencyMsTotal += Date.now() - start;
+      const latencyMs = Date.now() - start;
+      metrics.toolCallLatencyMsTotal += latencyMs;
+      observeLatency(latencyMs);
+      observeStatus(response.status);
       if (response.attempts > 1) {
         metrics.retriesTotal += response.attempts - 1;
+      }
+
+      if (responseTransform) {
+        response.body = await responseTransform({ operation, response: { body: response.body, status: response.status } });
       }
 
       const structuredContent = toStructuredContent(operation, response.body);
@@ -288,6 +318,7 @@ async function startWebServer(state: RuntimeState, cli: CliOptions, specPath: st
   );
 
   app.get("/health", (c) => c.json({ ok: true, transport: cli.transport }));
+  app.get("/healthz", (c) => c.json({ ok: true, transport: cli.transport }));
   app.get("/metrics", (c) => c.text(renderPrometheus()));
   app.get("/test/streamable", (c) => c.html(STREAMABLE_TEST_HTML));
   app.get("/test/sse", (c) => c.html(SSE_TEST_HTML));
@@ -305,7 +336,7 @@ async function startWebServer(state: RuntimeState, cli: CliOptions, specPath: st
     });
   }
 
-  serve({ fetch: app.fetch, port: cli.port });
+  const server = serve({ fetch: app.fetch, port: cli.port });
   process.stderr.write(
     `Listening on http://localhost:${cli.port} (${cli.transport})\n` +
       `Health: http://localhost:${cli.port}/health\n` +
@@ -314,11 +345,15 @@ async function startWebServer(state: RuntimeState, cli: CliOptions, specPath: st
       `SSE Test: http://localhost:${cli.port}/test/sse\n`
   );
 
+  wireGracefulShutdown(async () => {
+    server.close();
+  });
+
   await new Promise(() => undefined);
 }
 
 async function startSseServer(state: RuntimeState, cli: CliOptions, specPath: string): Promise<void> {
-  const transports = new Map<string, SSEServerTransport>();
+  const transports = new Map<string, { transport: SSEServerTransport; createdAt: number }>();
 
   const server = createHttpServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${cli.port}`);
@@ -352,8 +387,15 @@ async function startSseServer(state: RuntimeState, cli: CliOptions, specPath: st
     }
 
     if (req.method === "GET" && url.pathname === "/sse") {
+      if (transports.size >= cli.runtime.sseMaxSessions) {
+        res.statusCode = 503;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ error: "Too many active SSE sessions" }));
+        return;
+      }
+
       const transport = new SSEServerTransport("/messages", res);
-      transports.set(transport.sessionId, transport);
+      transports.set(transport.sessionId, { transport, createdAt: Date.now() });
       transport.onclose = () => transports.delete(transport.sessionId);
       const mcp = createMcpServer(state, cli);
       await mcp.connect(transport);
@@ -369,8 +411,10 @@ async function startSseServer(state: RuntimeState, cli: CliOptions, specPath: st
         return;
       }
 
-      const transport = transports.get(sessionId) ?? (transports.size === 1 ? [...transports.values()][0] : undefined);
-      if (!transport) {
+      evictExpiredSseSessions(transports, cli.runtime.sseSessionTtlMs);
+
+      const stored = transports.get(sessionId) ?? (transports.size === 1 ? [...transports.values()][0] : undefined);
+      if (!stored) {
         res.statusCode = 404;
         res.setHeader("content-type", "application/json");
         res.end(JSON.stringify({ error: "Session not found" }));
@@ -385,7 +429,7 @@ async function startSseServer(state: RuntimeState, cli: CliOptions, specPath: st
       if (chunks.length > 0) {
         parsedBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
       }
-      await transport.handlePostMessage(req as IncomingMessage, res as ServerResponse, parsedBody);
+      await stored.transport.handlePostMessage(req as IncomingMessage, res as ServerResponse, parsedBody);
       return;
     }
 
@@ -398,6 +442,12 @@ async function startSseServer(state: RuntimeState, cli: CliOptions, specPath: st
   }
 
   server.listen(cli.port);
+  wireGracefulShutdown(async () => {
+    for (const entry of transports.values()) {
+      await entry.transport.close();
+    }
+    server.close();
+  });
   process.stderr.write(
     `Listening on http://localhost:${cli.port} (sse)\\n` +
       `Health: http://localhost:${cli.port}/health\\n` +
@@ -414,7 +464,7 @@ function wireSpecWatcher(specPath: string, cli: CliOptions, state: RuntimeState,
     if (debounce) clearTimeout(debounce);
     debounce = setTimeout(async () => {
       try {
-        const next = await loadRuntimeState(specPath, cli.serverUrl, cli.cachePath);
+        const next = await loadRuntimeState(specPath, cli.serverUrl, cli.cachePath, cli.compile);
         state.operations = next.operations;
         state.validators = next.validators;
         await onReload();
@@ -425,8 +475,19 @@ function wireSpecWatcher(specPath: string, cli: CliOptions, state: RuntimeState,
   });
 }
 
-async function loadRuntimeState(specPath: string, serverUrl: string | undefined, cachePath: string): Promise<RuntimeState> {
-  const operations = await compileWithCache(specPath, serverUrl, cachePath);
+async function loadRuntimeState(specPath: string, serverUrl: string | undefined, cachePath: string, compile: CompileOptions): Promise<RuntimeState> {
+  const doc = await loadOpenApiDocument(specPath);
+  const diagnostics = lintOpenApiDocument(doc, compile);
+  const errors = diagnostics.filter((d) => d.level === "error");
+  if (errors.length > 0) {
+    throw new Error(`OpenAPI lint failed:\n${errors.map((d) => `- [${d.code}] ${d.message}${d.location ? ` (${d.location})` : ""}`).join("\n")}`);
+  }
+  const warnings = diagnostics.filter((d) => d.level === "warning");
+  if (warnings.length > 0) {
+    process.stderr.write(`${warnings.map((d) => `Warning [${d.code}] ${d.message}${d.location ? ` (${d.location})` : ""}`).join("\n")}\n`);
+  }
+
+  const operations = await compileWithCache(specPath, serverUrl, cachePath, compile);
   const validators = buildValidators(operations);
   return { operations, validators };
 }
@@ -600,12 +661,144 @@ function asObject(value: unknown): Record<string, unknown> {
   return isObject(value) ? (value as Record<string, unknown>) : { value };
 }
 
+function isToolAllowed(operation: OperationModel, runtime: RuntimeOptions): boolean {
+  if (runtime.allowedMethods.length > 0 && !runtime.allowedMethods.includes(operation.method.toUpperCase())) {
+    return false;
+  }
+
+  if (runtime.allowedPathPrefixes.length > 0 && !runtime.allowedPathPrefixes.some((prefix) => operation.pathTemplate.startsWith(prefix))) {
+    return false;
+  }
+
+  if (runtime.allowToolPatterns.length > 0 && !runtime.allowToolPatterns.some((pattern) => minimatch(operation.operationId, pattern))) {
+    return false;
+  }
+
+  if (runtime.denyToolPatterns.some((pattern) => minimatch(operation.operationId, pattern))) {
+    return false;
+  }
+
+  return true;
+}
+
+function minimatch(value: string, pattern: string): boolean {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*");
+  const re = new RegExp(`^${escaped}$`);
+  return re.test(value);
+}
+
+async function loadResponseTransform(modulePath: string): Promise<(ctx: { operation: OperationModel; response: { body: unknown; status: number } }) => unknown | Promise<unknown>> {
+  const loaded = (await import(resolve(modulePath))) as Record<string, unknown>;
+  const fn = (typeof loaded.default === "function" ? loaded.default : loaded.transform) as unknown;
+  if (typeof fn !== "function") {
+    throw new Error(`Response transform module must export default function or named export "transform": ${modulePath}`);
+  }
+  return fn as (ctx: { operation: OperationModel; response: { body: unknown; status: number } }) => unknown | Promise<unknown>;
+}
+
+function evictExpiredSseSessions(transports: Map<string, { transport: SSEServerTransport; createdAt: number }>, ttlMs: number): void {
+  const now = Date.now();
+  for (const [sessionId, entry] of transports.entries()) {
+    if (now - entry.createdAt > ttlMs) {
+      void entry.transport.close();
+      transports.delete(sessionId);
+    }
+  }
+}
+
+function wireGracefulShutdown(cleanup: () => Promise<void> | void): void {
+  const handler = async () => {
+    await cleanup();
+    process.exit(0);
+  };
+  process.once("SIGINT", handler);
+  process.once("SIGTERM", handler);
+}
+
+async function generateProjectFromSpec(targetDir: string, specPath: string, operations: Map<string, OperationModel>, cli: CliOptions): Promise<void> {
+  const dir = resolve(targetDir);
+  const srcDir = resolve(dir, "src");
+  await mkdir(srcDir, { recursive: true });
+
+  const generated = [
+    "import { spawn } from \"node:child_process\";",
+    "",
+    "const transport = process.env.MCP_TRANSPORT ?? \"stdio\";",
+    "const port = process.env.PORT ?? \"3000\";",
+    "const args = [",
+    `  "--spec", ${JSON.stringify(specPath)},`,
+    cli.serverUrl ? `  "--server-url", ${JSON.stringify(cli.serverUrl)},` : "",
+    `  "--tool-name-template", ${JSON.stringify(cli.compile.toolNameTemplate ?? "{operationId}")},`,
+    cli.compile.strict ? "  \"--strict\"," : "",
+    "  \"--transport\", transport",
+    "].filter(Boolean) as string[];",
+    "if (transport !== \"stdio\") args.push(\"--port\", port);",
+    "const child = spawn(\"mcp-openapi\", args, { stdio: \"inherit\", shell: true, env: process.env });",
+    "child.on(\"exit\", (code) => process.exit(code ?? 1));"
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  await writeFile(resolve(srcDir, "server.ts"), `${generated}\n`, "utf8");
+  await writeFile(
+    resolve(dir, "package.json"),
+    `${JSON.stringify(
+      {
+        name: `${basename(dir).replaceAll(/[^a-zA-Z0-9-_]/g, "-").toLowerCase()}-generated`,
+        private: true,
+        version: "0.1.0",
+        type: "module",
+        scripts: {
+          dev: "tsx src/server.ts",
+          build: "tsc -p tsconfig.json",
+          start: "node dist/server.js"
+        },
+        dependencies: { "mcp-openapi": "latest" },
+        devDependencies: { typescript: "^5.7.3", tsx: "^4.20.3", "@types/node": "^22.13.4" }
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await writeFile(
+    resolve(dir, "tsconfig.json"),
+    `${JSON.stringify(
+      {
+        compilerOptions: {
+          target: "ES2022",
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          outDir: "dist",
+          rootDir: "src",
+          strict: true,
+          skipLibCheck: true
+        },
+        include: ["src/**/*.ts"]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await writeFile(
+    resolve(dir, "README.md"),
+    `# Generated MCP Server\n\nGenerated from \`${specPath}\`.\n\n## Tools\n\n${[...operations.values()]
+      .map((x) => `- \`${x.operationId}\` (${x.method} ${x.pathTemplate})`)
+      .join("\n")}\n`,
+    "utf8"
+  );
+}
+
 function parseArgs(argv: string[]): CliOptions {
   let command: CliOptions["command"] = "run";
   let initDir: string | undefined;
+  let generateDir: string | undefined;
   let specPath = "";
   let serverUrl: string | undefined;
   let cachePath = ".cache/mcp-openapi-cache.json";
+  let strict = false;
+  let toolNameTemplate = "{operationId}";
   let printTools = false;
   let validateSpec = false;
   let watchSpec = false;
@@ -617,6 +810,13 @@ function parseArgs(argv: string[]): CliOptions {
   let maxResponseBytes = 2_000_000;
   let maxConcurrency = 8;
   let allowedHosts: string[] = [];
+  let allowToolPatterns: string[] = [];
+  let denyToolPatterns: string[] = [];
+  let allowedMethods: string[] = [];
+  let allowedPathPrefixes: string[] = [];
+  let responseTransformModule: string | undefined;
+  let sseMaxSessions = 100;
+  let sseSessionTtlMs = 300_000;
 
   if (argv[0] === "init") {
     command = "init";
@@ -627,13 +827,32 @@ function parseArgs(argv: string[]): CliOptions {
       specPath,
       serverUrl,
       cachePath,
+      compile: { strict, toolNameTemplate },
       printTools,
       validateSpec,
       watchSpec,
       transport,
       port,
-      runtime: { timeoutMs, retries, retryDelayMs, maxResponseBytes, allowedHosts, maxConcurrency }
+      runtime: {
+        timeoutMs,
+        retries,
+        retryDelayMs,
+        maxResponseBytes,
+        allowedHosts,
+        maxConcurrency,
+        allowToolPatterns,
+        denyToolPatterns,
+        allowedMethods,
+        allowedPathPrefixes,
+        responseTransformModule,
+        sseMaxSessions,
+        sseSessionTtlMs
+      }
     };
+  }
+  if (argv[0] === "generate") {
+    command = "generate";
+    argv = argv.slice(1);
   }
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -648,6 +867,18 @@ function parseArgs(argv: string[]): CliOptions {
     }
     if (arg === "--cache-path") {
       cachePath = argv[++i] ?? cachePath;
+      continue;
+    }
+    if (arg === "--out-dir") {
+      generateDir = argv[++i] ?? "generated-mcp-server";
+      continue;
+    }
+    if (arg === "--strict") {
+      strict = true;
+      continue;
+    }
+    if (arg === "--tool-name-template") {
+      toolNameTemplate = argv[++i] ?? toolNameTemplate;
       continue;
     }
     if (arg === "--print-tools") {
@@ -679,10 +910,35 @@ function parseArgs(argv: string[]): CliOptions {
       continue;
     }
     if (arg === "--allow-hosts") {
-      allowedHosts = String(argv[++i] ?? "")
-        .split(",")
-        .map((x) => x.trim())
-        .filter(Boolean);
+      allowedHosts = parseCsv(argv[++i]);
+      continue;
+    }
+    if (arg === "--allow-tools") {
+      allowToolPatterns = parseCsv(argv[++i]);
+      continue;
+    }
+    if (arg === "--deny-tools") {
+      denyToolPatterns = parseCsv(argv[++i]);
+      continue;
+    }
+    if (arg === "--allow-methods") {
+      allowedMethods = parseCsv(argv[++i]).map((x) => x.toUpperCase());
+      continue;
+    }
+    if (arg === "--allow-path-prefixes") {
+      allowedPathPrefixes = parseCsv(argv[++i]);
+      continue;
+    }
+    if (arg === "--response-transform") {
+      responseTransformModule = argv[++i];
+      continue;
+    }
+    if (arg === "--sse-max-sessions") {
+      sseMaxSessions = parsePositiveInt(argv[++i], "--sse-max-sessions");
+      continue;
+    }
+    if (arg === "--sse-session-ttl-ms") {
+      sseSessionTtlMs = parsePositiveInt(argv[++i], "--sse-session-ttl-ms");
       continue;
     }
     if (arg === "--transport") {
@@ -715,16 +971,39 @@ function parseArgs(argv: string[]): CliOptions {
   return {
     command,
     initDir,
+    generateDir,
     specPath,
     serverUrl,
     cachePath,
+    compile: { strict, toolNameTemplate },
     printTools,
     validateSpec,
     watchSpec,
     transport,
     port,
-    runtime: { timeoutMs, retries, retryDelayMs, maxResponseBytes, allowedHosts, maxConcurrency }
+    runtime: {
+      timeoutMs,
+      retries,
+      retryDelayMs,
+      maxResponseBytes,
+      allowedHosts,
+      maxConcurrency,
+      allowToolPatterns,
+      denyToolPatterns,
+      allowedMethods,
+      allowedPathPrefixes,
+      responseTransformModule,
+      sseMaxSessions,
+      sseSessionTtlMs
+    }
   };
+}
+
+function parseCsv(value: string | undefined): string[] {
+  return String(value ?? "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
 }
 
 function parsePositiveInt(value: string | undefined, flag: string): number {
@@ -748,11 +1027,15 @@ function printHelp(): void {
     [
       "Usage:",
       "  mcp-openapi init [dir]",
+      "  mcp-openapi generate --spec <openapi-file> [--out-dir ./generated]",
       "  mcp-openapi --spec <openapi-file> [options]",
       "",
       "Options:",
       "  --server-url <url>",
       "  --cache-path <file>",
+      "  --out-dir <dir>",
+      "  --strict",
+      "  --tool-name-template <template>",
       "  --print-tools",
       "  --validate-spec",
       "  --transport stdio|streamable-http|sse",
@@ -764,6 +1047,13 @@ function printHelp(): void {
       "  --max-response-bytes <n>",
       "  --max-concurrency <n>",
       "  --allow-hosts host1,host2",
+      "  --allow-tools pattern1,pattern2",
+      "  --deny-tools pattern1,pattern2",
+      "  --allow-methods GET,POST",
+      "  --allow-path-prefixes /v1,/public",
+      "  --response-transform <module-path>",
+      "  --sse-max-sessions <n>",
+      "  --sse-session-ttl-ms <ms>",
       "",
       "Auth env vars:",
       "  MCP_OPENAPI_API_KEY",
