@@ -106,3 +106,41 @@ test("loadOpenApiDocument tolerates missing internal refs while preserving valid
   );
   assert.ok(op.successResponseSchema);
 });
+
+test("loadOpenApiDocument still fails on missing external refs", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "mcp-openapi-"));
+  t.after(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const specPath = join(dir, "missing-external-ref.json");
+  const spec = {
+    openapi: "3.0.3",
+    info: {
+      title: "Missing external ref",
+      version: "1.0.0"
+    },
+    servers: [{ url: "https://api.example.com" }],
+    paths: {
+      "/widgets": {
+        get: {
+          operationId: "listWidgets",
+          responses: {
+            "200": {
+              description: "ok",
+              content: {
+                "application/json": {
+                  schema: { $ref: "./schemas.json#/WidgetList" }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  await writeFile(specPath, JSON.stringify(spec), "utf8");
+
+  await assert.rejects(() => loadOpenApiDocument(specPath));
+});

@@ -55,6 +55,8 @@ export function lintOpenApiDocument(doc: Record<string, unknown>, options: Compi
     });
   }
 
+  collectBrokenInternalRefDiagnostics(doc, doc, diagnostics);
+
   const seenOperationIds = new Set<string>();
   const paths = isObject(doc.paths) ? (doc.paths as Record<string, unknown>) : {};
   for (const [path, rawPathItem] of Object.entries(paths)) {
@@ -137,6 +139,70 @@ export function lintOpenApiDocument(doc: Record<string, unknown>, options: Compi
   }
 
   return diagnostics;
+}
+
+function collectBrokenInternalRefDiagnostics(
+  value: unknown,
+  root: Record<string, unknown>,
+  diagnostics: LintDiagnostic[],
+  location = "$"
+): void {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      collectBrokenInternalRefDiagnostics(value[index], root, diagnostics, `${location}[${index}]`);
+    }
+    return;
+  }
+
+  if (!isObject(value)) {
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const ref = typeof record["$ref"] === "string" ? record["$ref"] : undefined;
+  if (ref?.startsWith("#/") && resolveJsonPointer(root, ref) === undefined) {
+    diagnostics.push({
+      level: "warning",
+      code: "BROKEN_INTERNAL_REF",
+      message: `Broken internal $ref: ${ref}`,
+      location: `${location}.$ref`
+    });
+  }
+
+  for (const [key, child] of Object.entries(record)) {
+    collectBrokenInternalRefDiagnostics(child, root, diagnostics, `${location}.${key}`);
+  }
+}
+
+function resolveJsonPointer(root: unknown, ref: string): unknown {
+  if (ref === "#") {
+    return root;
+  }
+
+  const tokens = ref
+    .slice(2)
+    .split("/")
+    .map((token) => token.replace(/~1/g, "/").replace(/~0/g, "~"));
+
+  let current: unknown = root;
+  for (const token of tokens) {
+    if (Array.isArray(current)) {
+      const index = Number.parseInt(token, 10);
+      if (!Number.isFinite(index)) {
+        return undefined;
+      }
+      current = current[index];
+      continue;
+    }
+
+    if (!isObject(current)) {
+      return undefined;
+    }
+
+    current = (current as Record<string, unknown>)[token];
+  }
+
+  return current;
 }
 
 function isObject(value: unknown): value is object {

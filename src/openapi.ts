@@ -18,7 +18,7 @@ export async function loadOpenApiDocument(specPath: string): Promise<Record<stri
     validateShape(dereferenced as Record<string, unknown>, absPath);
     return dereferenced as Record<string, unknown>;
   } catch (error) {
-    if (!isMissingPointerError(error)) {
+    if (!isInternalMissingPointerError(error)) {
       throw error;
     }
 
@@ -184,13 +184,18 @@ function mergeObjects(base: Record<string, unknown>, overlay: Record<string, unk
   return merged;
 }
 
-function isMissingPointerError(error: unknown): boolean {
+function isInternalMissingPointerError(error: unknown): boolean {
   if (!error || typeof error !== "object") {
     return false;
   }
 
-  const candidate = error as { code?: unknown; name?: unknown };
-  return candidate.code === "EMISSINGPOINTER" || candidate.name === "MissingPointerError";
+  const candidate = error as { code?: unknown; name?: unknown; targetRef?: unknown };
+  const isMissingPointer = candidate.code === "EMISSINGPOINTER" || candidate.name === "MissingPointerError";
+  if (!isMissingPointer) {
+    return false;
+  }
+
+  return typeof candidate.targetRef === "string" && candidate.targetRef.startsWith("#");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

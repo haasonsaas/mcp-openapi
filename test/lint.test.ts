@@ -47,3 +47,49 @@ test("lintOpenApiDocument warns on unsupported request media type", () => {
   const diagnostics = lintOpenApiDocument(doc, { strict: false });
   assert.ok(diagnostics.some((d) => d.code === "REQUEST_MEDIA_TYPE_UNSUPPORTED"));
 });
+
+test("lintOpenApiDocument warns on broken internal refs", () => {
+  const doc = {
+    openapi: "3.0.3",
+    servers: [{ url: "https://api.example.com" }],
+    paths: {
+      "/widgets": {
+        get: {
+          operationId: "listWidgets",
+          responses: {
+            "200": {
+              description: "ok",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/WidgetList" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    components: {
+      schemas: {
+        WidgetList: {
+          type: "object",
+          properties: {
+            items: {
+              type: "array",
+              items: { $ref: "#/components/schemas/MissingWidget" }
+            }
+          }
+        }
+      }
+    }
+  } as Record<string, unknown>;
+
+  const diagnostics = lintOpenApiDocument(doc, { strict: false });
+  assert.ok(
+    diagnostics.some(
+      (d) =>
+        d.code === "BROKEN_INTERNAL_REF" &&
+        d.location === "$.components.schemas.WidgetList.properties.items.items.$ref"
+    )
+  );
+});

@@ -25,7 +25,7 @@ import { paginateWithCursor } from "./pagination.js";
 import { observeLatency, observeStatus, renderPrometheus, metrics } from "./metrics.js";
 import type { CompileOptions, OperationModel, RuntimeOptions } from "./types.js";
 import { zodFromJsonSchema } from "./zod-schema.js";
-import { compileWithCache } from "./compile-cache.js";
+import { compileDocumentWithCache } from "./compile-cache.js";
 import { lintOpenApiDocument } from "./lint.js";
 import { loadOpenApiDocument } from "./openapi.js";
 
@@ -487,7 +487,7 @@ async function loadRuntimeState(specPath: string, serverUrl: string | undefined,
     process.stderr.write(`${warnings.map((d) => `Warning [${d.code}] ${d.message}${d.location ? ` (${d.location})` : ""}`).join("\n")}\n`);
   }
 
-  const operations = await compileWithCache(specPath, serverUrl, cachePath, compile);
+  const operations = await compileDocumentWithCache(doc, specPath, serverUrl, cachePath, compile);
   const validators = buildValidators(operations);
   return { operations, validators };
 }

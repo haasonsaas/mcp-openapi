@@ -5,6 +5,8 @@ import { compileOperations } from "./compiler.js";
 import { loadOpenApiDocument } from "./openapi.js";
 import type { CompileOptions, OperationModel } from "./types.js";
 
+const CACHE_FORMAT_VERSION = 2;
+
 interface CacheEntry {
   hash: string;
   operations: OperationModel[];
@@ -17,8 +19,7 @@ export async function loadFromCompileCache(
   options: CompileOptions = {}
 ): Promise<Map<string, OperationModel> | null> {
   try {
-    const doc = await loadOpenApiDocument(specPath);
-    const hash = computeHash({ doc, serverUrl, options });
+    const hash = await computeSpecInputHash(specPath, serverUrl, options);
     const raw = await readFile(resolve(cachePath), "utf8");
     const parsed = JSON.parse(raw) as CacheEntry;
     if (parsed.hash !== hash) {
@@ -37,15 +38,26 @@ export async function compileWithCache(
   cachePath: string,
   options: CompileOptions = {}
 ): Promise<Map<string, OperationModel>> {
-  const cached = await loadFromCompileCache(specPath, serverUrl, cachePath, options);
+  const doc = await loadOpenApiDocument(specPath);
+  return compileDocumentWithCache(doc, specPath, serverUrl, cachePath, options);
+}
+
+export async function compileDocumentWithCache(
+  doc: Record<string, unknown>,
+  specPath: string,
+  serverUrl: string | undefined,
+  cachePath: string,
+  options: CompileOptions = {}
+): Promise<Map<string, OperationModel>> {
+  const hash = await computeSpecInputHash(specPath, serverUrl, options);
+  const cached = await readCacheEntry(cachePath, hash);
   if (cached) {
     return cached;
   }
 
-  const doc = await loadOpenApiDocument(specPath);
   const operations = compileOperations(doc, serverUrl, options);
   const entry: CacheEntry = {
-    hash: computeHash({ doc, serverUrl, options }),
+    hash,
     operations: [...operations.values()]
   };
 
@@ -54,6 +66,34 @@ export async function compileWithCache(
   await writeFile(abs, JSON.stringify(entry), "utf8");
 
   return operations;
+}
+
+async function readCacheEntry(cachePath: string, hash: string): Promise<Map<string, OperationModel> | null> {
+  try {
+    const raw = await readFile(resolve(cachePath), "utf8");
+    const parsed = JSON.parse(raw) as CacheEntry;
+    if (parsed.hash !== hash) {
+      return null;
+    }
+
+    return new Map(parsed.operations.map((op) => [op.operationId, op]));
+  } catch {
+    return null;
+  }
+}
+
+async function computeSpecInputHash(
+  specPath: string,
+  serverUrl: string | undefined,
+  options: CompileOptions
+): Promise<string> {
+  const rawSpec = await readFile(resolve(specPath), "utf8");
+  return computeHash({
+    cacheFormatVersion: CACHE_FORMAT_VERSION,
+    rawSpec,
+    serverUrl,
+    options
+  });
 }
 
 function computeHash(value: unknown): string {
