@@ -56,7 +56,7 @@ npm install
 Consume as a library from GitHub:
 
 ```bash
-npm install github:haasonsaas/mcp-openapi
+npm install github:evalops/mcp-openapi
 ```
 
 ## Library Usage
