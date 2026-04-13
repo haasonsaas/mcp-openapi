@@ -47,7 +47,7 @@ export async function executeOperation(
 
   if (!pagination.enabled) {
     throwIfAborted(hooks.signal);
-    const plan = await buildInvocationPlan(operation, args, runtimeOptions.allowedHosts);
+    const plan = await buildInvocationPlan(operation, args, runtimeOptions.allowedHosts, undefined, runtimeOptions.authScopes);
     const result = await fetchWithRetry(plan, runtimeOptions, hooks);
 
     await emitProgress(hooks, { progress: 1, total: 1, message: "Request complete" });
@@ -68,7 +68,8 @@ export async function buildInvocationPlan(
   operation: OperationModel,
   input: Record<string, unknown>,
   allowedHosts?: string[],
-  queryOverride?: Record<string, unknown>
+  queryOverride?: Record<string, unknown>,
+  authScopes?: Record<string, string>
 ): Promise<InvocationPlan> {
   const pathParams = asRecord(input.path);
   const queryParams = queryOverride ?? asRecord(input.query);
@@ -84,7 +85,7 @@ export async function buildInvocationPlan(
   const headers: Record<string, string> = {};
   applyHeaderParams(headers, operation.parameters.filter((p) => p.in === "header"), headerParams);
   applyCookieParams(headers, operation.parameters.filter((p) => p.in === "cookie"), cookieParams);
-  await applyAuth(headers, url, cookieParams, operation.authOptions);
+  await applyAuth(headers, url, cookieParams, operation.authOptions, operation.tags, authScopes);
 
   const body = await encodeBody(input.body, operation.requestBodyContentType);
 
@@ -136,7 +137,7 @@ async function executePaginated(
       currentPage += 1;
     }
 
-    const plan = await buildInvocationPlan(operation, input, runtime.allowedHosts, query);
+    const plan = await buildInvocationPlan(operation, input, runtime.allowedHosts, query, runtime.authScopes);
     const result = await fetchWithRetry(plan, runtime, hooks);
     const body = await parseResponseBody(result.response, runtime.maxResponseBytes);
     totalAttempts += result.attempt;
@@ -395,15 +396,28 @@ function buildBinary(value: unknown): BodyInit {
   throw new Error("application/octet-stream body must be string, base64:string, Blob, ArrayBuffer, or Uint8Array");
 }
 
-async function applyAuth(headers: Record<string, string>, url: URL, cookieParams: Record<string, unknown>, authOptions: AuthRequirement[]): Promise<void> {
+function resolveEnvPrefix(tags?: string[], authScopes?: Record<string, string>): string {
+  if (authScopes && tags) {
+    for (const tag of tags) {
+      const prefix = authScopes[tag];
+      if (prefix) {
+        return `${prefix}_`;
+      }
+    }
+  }
+  return "MCP_OPENAPI_";
+}
+
+async function applyAuth(headers: Record<string, string>, url: URL, cookieParams: Record<string, unknown>, authOptions: AuthRequirement[], tags?: string[], authScopes?: Record<string, string>): Promise<void> {
   if (authOptions.length === 0) return;
 
   const selected = authOptions[0];
+  const envPrefix = resolveEnvPrefix(tags, authScopes);
   for (const scheme of selected.schemes) {
-    const keyByName = process.env[`MCP_OPENAPI_${scheme.name.toUpperCase()}_TOKEN`];
+    const keyByName = process.env[`${envPrefix}${scheme.name.toUpperCase()}_TOKEN`];
 
     if (scheme.type === "apiKey") {
-      const token = keyByName ?? process.env.MCP_OPENAPI_API_KEY;
+      const token = keyByName ?? process.env[`${envPrefix}API_KEY`];
       if (!token) continue;
       if (scheme.in === "query") url.searchParams.set(scheme.name, token);
       else if (scheme.in === "cookie") headers.cookie = `${headers.cookie ? `${headers.cookie}; ` : ""}${scheme.name}=${token}`;
@@ -412,14 +426,14 @@ async function applyAuth(headers: Record<string, string>, url: URL, cookieParams
     }
 
     if (scheme.type === "http" && scheme.scheme?.toLowerCase() === "bearer") {
-      const token = keyByName ?? process.env.MCP_OPENAPI_BEARER_TOKEN;
+      const token = keyByName ?? process.env[`${envPrefix}BEARER_TOKEN`];
       if (token) headers.authorization = `Bearer ${token}`;
       continue;
     }
 
     if (scheme.type === "http" && scheme.scheme?.toLowerCase() === "basic") {
-      const username = process.env.MCP_OPENAPI_BASIC_USERNAME;
-      const password = process.env.MCP_OPENAPI_BASIC_PASSWORD;
+      const username = process.env[`${envPrefix}BASIC_USERNAME`];
+      const password = process.env[`${envPrefix}BASIC_PASSWORD`];
       if (username && password) headers.authorization = `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
       continue;
     }
@@ -427,8 +441,8 @@ async function applyAuth(headers: Record<string, string>, url: URL, cookieParams
     if (scheme.type === "oauth2" || scheme.type === "openIdConnect") {
       const token =
         keyByName ??
-        process.env.MCP_OPENAPI_OAUTH2_ACCESS_TOKEN ??
-        process.env.MCP_OPENAPI_BEARER_TOKEN ??
+        process.env[`${envPrefix}OAUTH2_ACCESS_TOKEN`] ??
+        process.env[`${envPrefix}BEARER_TOKEN`] ??
         (await getOAuth2AccessToken(scheme));
       if (token) headers.authorization = `Bearer ${token}`;
       continue;
@@ -676,7 +690,9 @@ function withRuntimeDefaults(runtime: RuntimeOptions | Partial<RuntimeOptions>):
     allowedPathPrefixes: runtime.allowedPathPrefixes ?? [],
     responseTransformModule: runtime.responseTransformModule,
     sseMaxSessions: runtime.sseMaxSessions ?? 100,
-    sseSessionTtlMs: runtime.sseSessionTtlMs ?? 300_000
+    sseSessionTtlMs: runtime.sseSessionTtlMs ?? 300_000,
+    authScopes: runtime.authScopes,
+    policyWebhookUrl: runtime.policyWebhookUrl
   };
 }
 

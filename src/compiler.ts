@@ -25,7 +25,13 @@ export function compileOperations(doc: Record<string, unknown>, serverOverride?:
       }
 
       const operation = rawOperation as Record<string, unknown>;
-      const operationId = getOperationId(operation, method, pathTemplate, operations, options.toolNameTemplate);
+
+      // x-mcp-hidden: skip operation entirely
+      if (operation["x-mcp-hidden"] === true) {
+        continue;
+      }
+
+      const operationId = getOperationId(operation, method, pathTemplate, operations, options.toolNameTemplate, options.toolNameSeparator);
       const operationParameters = normalizeParameters(operation.parameters);
       const mergedParameters = mergeParameters(pathParameters, operationParameters);
       const requestBody = normalizeRequestBody(operation.requestBody);
@@ -37,6 +43,9 @@ export function compileOperations(doc: Record<string, unknown>, serverOverride?:
       const resolvedServers = resolveServersForOperation(doc, pathItem, operation, rootServers, serverOverride);
       const output = buildOutputSchema(response?.schema);
 
+      // Description enrichment: x-mcp-description > descriptionFile > summary/description > humanized
+      const enrichedDescription = resolveEnrichedDescription(operation, operationId, options.descriptionFile);
+
       const model: OperationModel = {
         operationId,
         title: typeof operation.summary === "string" ? operation.summary : undefined,
@@ -44,7 +53,7 @@ export function compileOperations(doc: Record<string, unknown>, serverOverride?:
         method: method.toUpperCase(),
         pathTemplate,
         description: String(operation.description ?? operation.summary ?? `${method.toUpperCase()} ${pathTemplate}`),
-        toolDescription: buildToolDescription(method, pathTemplate, operation, authOptions.length > 0),
+        toolDescription: buildToolDescription(method, pathTemplate, operation, authOptions.length > 0, operationId, enrichedDescription),
         inputSchema: buildInputSchema(mergedParameters, requestBody?.schema),
         outputSchema: output.schema,
         outputWrapKey: output.wrapKey,
@@ -67,6 +76,24 @@ export function compileOperations(doc: Record<string, unknown>, serverOverride?:
   }
 
   return operations;
+}
+
+function resolveEnrichedDescription(
+  operation: Record<string, unknown>,
+  operationId: string,
+  descriptionFile?: Record<string, string>
+): string | undefined {
+  // Priority 1: x-mcp-description extension
+  if (typeof operation["x-mcp-description"] === "string" && operation["x-mcp-description"].trim()) {
+    return operation["x-mcp-description"] as string;
+  }
+
+  // Priority 2: descriptionFile mapping
+  if (descriptionFile && operationId in descriptionFile) {
+    return descriptionFile[operationId];
+  }
+
+  return undefined;
 }
 
 function resolveServersForOperation(
@@ -224,9 +251,11 @@ function getOperationId(
   method: string,
   pathTemplate: string,
   existing: Map<string, OperationModel>,
-  toolNameTemplate?: string
+  toolNameTemplate?: string,
+  toolNameSeparator?: string
 ): string {
   const rawId = typeof operation.operationId === "string" ? operation.operationId : undefined;
+  const sep = toolNameSeparator ?? "_";
   const pathName = `${method}_${pathTemplate}`
     .replace(/[{}]/g, "")
     .replace(/[^a-zA-Z0-9_-]+/g, "_")
@@ -235,6 +264,12 @@ function getOperationId(
     Array.isArray(operation.tags) && typeof operation.tags[0] === "string"
       ? String(operation.tags[0]).replace(/[^a-zA-Z0-9_-]+/g, "_")
       : "";
+
+  // Extract service name from ConnectRPC-style operationIds or first tag
+  const serviceName = rawId && rawId.includes("_")
+    ? rawId.split("_", 1)[0]!.replace(/Service$/, "").replace(/[^a-zA-Z0-9_-]+/g, "_")
+    : tagName;
+
   const fallback = pathName || "operation";
 
   const template = typeof toolNameTemplate === "string" && toolNameTemplate.trim() ? toolNameTemplate : "{operationId}";
@@ -243,34 +278,52 @@ function getOperationId(
     .replaceAll("{method}", method)
     .replaceAll("{path}", pathName)
     .replaceAll("{tag}", tagName)
+    .replaceAll("{service}", serviceName)
     .trim();
 
-  let id = normalizeToolName(renderedTemplate || rawId || fallback);
+  let id = normalizeToolName(renderedTemplate || rawId || fallback, sep);
   let i = 1;
   while (existing.has(id)) {
     i += 1;
-    id = normalizeToolName(`${id}_${i}`);
+    id = normalizeToolName(`${id}${sep}${i}`, sep);
   }
   return id;
 }
 
-function normalizeToolName(name: string): string {
-  const cleaned = name.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
+function normalizeToolName(name: string, separator: string = "_"): string {
+  const allowedSep = separator === "." ? "." : "_";
+  const pattern = allowedSep === "." ? /[^a-zA-Z0-9_.-]+/g : /[^a-zA-Z0-9_-]+/g;
+  const cleaned = name.replace(pattern, "_").replace(/^[_.-]+|[_.-]+$/g, "");
   return (cleaned || "operation").slice(0, 128);
+}
+
+export function humanizeOperationId(operationId: string): string {
+  if (operationId.includes("_")) {
+    const [service, method] = operationId.split("_", 2);
+    if (service && method) {
+      const humanService = service.replace(/Service$/, "").replace(/([a-z])([A-Z])/g, "$1 $2");
+      const humanMethod = method.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+      return `${humanMethod.charAt(0).toUpperCase() + humanMethod.slice(1)}. Service: ${humanService}`;
+    }
+  }
+  return operationId.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, c => c.toUpperCase());
 }
 
 function buildToolDescription(
   method: string,
   pathTemplate: string,
   operation: Record<string, unknown>,
-  requiresAuth: boolean
+  requiresAuth: boolean,
+  operationId: string,
+  enrichedDescription?: string
 ): string {
   const summary = String(operation.summary ?? "").trim();
-  const description = String(operation.description ?? "").trim();
+  const description = enrichedDescription ?? String(operation.description ?? "").trim();
+  const autoDesc = (!summary && !description) ? humanizeOperationId(operationId) : "";
   const firstLine = `${method.toUpperCase()} ${pathTemplate}`;
   const authLine = requiresAuth ? "Auth required." : "No auth required.";
 
-  return [firstLine, summary, description, authLine].filter(Boolean).join("\n");
+  return [firstLine, summary, description || autoDesc, authLine].filter(Boolean).join("\n");
 }
 
 function buildInputSchema(parameters: ParameterSpec[], bodySchema?: JsonSchema): JsonSchema {
