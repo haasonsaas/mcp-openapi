@@ -31,8 +31,33 @@ test("generate command creates project files", async () => {
   const packageJson = await readFile(resolve(outDir, "package.json"), "utf8");
   const readme = await readFile(resolve(outDir, "README.md"), "utf8");
   const serverTs = await readFile(resolve(outDir, "src/server.ts"), "utf8");
+  const gateReadme = await readFile(resolve(outDir, "gate/README.md"), "utf8");
+  const gateConnector = await readFile(resolve(outDir, "gate/connector.yaml"), "utf8");
+  const gatePolicy = await readFile(resolve(outDir, "gate/policies/mcp_tool_allowlist.rego"), "utf8");
 
   assert.match(packageJson, /mcp-openapi/);
   assert.match(readme, /Generated MCP Server/);
+  assert.match(readme, /Gate Gateway/);
   assert.match(serverTs, /--spec/);
+  assert.match(gateReadme, /Point your MCP client at Gate/);
+  assert.match(gateConnector, /protocol: "mcp"/);
+  assert.match(gatePolicy, /approved_tools/);
+  assert.match(gatePolicy, /getHealth/);
+  assert.match(gatePolicy, /postEcho/);
+});
+
+test("init command creates Gate scaffold files", async () => {
+  const outDir = await mkdtemp(resolve(tmpdir(), "mcp-openapi-init-"));
+  const result = spawnSync(process.execPath, [tsxCli, "src/server.ts", "init", outDir], {
+    cwd: process.cwd(),
+    encoding: "utf8"
+  });
+
+  assert.equal(result.status, 0);
+
+  const gateReadme = await readFile(resolve(outDir, "gate/README.md"), "utf8");
+  const gateConnector = await readFile(resolve(outDir, "gate/connector.yaml"), "utf8");
+
+  assert.match(gateReadme, /Gate MCP Gateway/);
+  assert.match(gateConnector, /endpoint_path: "\/mcp"/);
 });

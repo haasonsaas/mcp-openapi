@@ -655,6 +655,7 @@ async function scaffoldProject(targetDir: string): Promise<void> {
     ].join("\n"),
     "utf8"
   );
+  await writeGateScaffoldFiles(dir, { upstreamPort: 3000, gateResourceName: "openapi-mcp" });
 }
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -783,11 +784,139 @@ async function generateProjectFromSpec(targetDir: string, specPath: string, oper
   );
   await writeFile(
     resolve(dir, "README.md"),
-    `# Generated MCP Server\n\nGenerated from \`${specPath}\`.\n\n## Tools\n\n${[...operations.values()]
-      .map((x) => `- \`${x.operationId}\` (${x.method} ${x.pathTemplate})`)
-      .join("\n")}\n`,
+    [
+      `# Generated MCP Server`,
+      ``,
+      `Generated from \`${specPath}\`.`,
+      ``,
+      `## Tools`,
+      ``,
+      [...operations.values()].map((x) => `- \`${x.operationId}\` (${x.method} ${x.pathTemplate})`).join("\n"),
+      ``,
+      `## Gate Gateway`,
+      ``,
+      `This project also includes \`gate/connector.yaml\` and \`gate/README.md\` so the generated Streamable HTTP server can sit behind Gate without extra wiring.`,
+      `Start this server with \`MCP_TRANSPORT=streamable-http npm run dev\`, then point a Gate connector at \`gate/connector.yaml\`.`
+    ].join("\n"),
     "utf8"
   );
+  await writeGateScaffoldFiles(dir, {
+    upstreamPort: 3000,
+    gateResourceName: "generated-openapi-mcp",
+    approvedTools: [...operations.values()].map((x) => x.operationId)
+  });
+}
+
+async function writeGateScaffoldFiles(
+  targetDir: string,
+  options: {
+    upstreamPort: number;
+    gateResourceName: string;
+    approvedTools?: string[];
+  }
+): Promise<void> {
+  const gateDir = resolve(targetDir, "gate");
+  const policiesDir = resolve(gateDir, "policies");
+  await mkdir(policiesDir, { recursive: true });
+
+  const hasPolicy = (options.approvedTools?.length ?? 0) > 0;
+  await writeFile(
+    resolve(gateDir, "connector.yaml"),
+    buildGateConnectorYaml(options.upstreamPort, options.gateResourceName, hasPolicy),
+    "utf8"
+  );
+  await writeFile(resolve(gateDir, "README.md"), buildGateReadme(options.upstreamPort, hasPolicy), "utf8");
+  if (hasPolicy) {
+    await writeFile(
+      resolve(policiesDir, "mcp_tool_allowlist.rego"),
+      buildGateToolAllowlistPolicy(options.approvedTools ?? []),
+      "utf8"
+    );
+  }
+}
+
+function buildGateConnectorYaml(upstreamPort: number, resourceName: string, hasPolicy: boolean): string {
+  const lines = [
+    "listen_addr: \":6432\"",
+    "health_addr: \":9081\"",
+    "",
+    "resources:",
+    `  - name: ${JSON.stringify(resourceName)}`,
+    "    protocol: \"mcp\"",
+    "    host: \"127.0.0.1\"",
+    `    port: ${upstreamPort}`,
+    "    listen_port: 7443",
+    "    endpoint_path: \"/mcp\""
+  ];
+  if (hasPolicy) {
+    lines.push(
+      "",
+      "policies:",
+      "  - path: \"gate/policies/mcp_tool_allowlist.rego\"",
+      "    stage: \"pre_request\""
+    );
+  }
+  lines.push(
+    "",
+    "recording:",
+    "  dir: \".data/gate-mcp-recordings\"",
+    "",
+    "logging:",
+    "  level: \"info\"",
+    "  format: \"json\""
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+function buildGateReadme(upstreamPort: number, hasPolicy: boolean): string {
+  const lines = [
+    "# Gate MCP Gateway",
+    "",
+    "This directory contains a ready-to-run Gate connector config for putting this `mcp-openapi` server behind Gate.",
+    "",
+    "## Local Flow",
+    "",
+    "1. Start this server in Streamable HTTP mode:",
+    `   \`MCP_TRANSPORT=streamable-http PORT=${upstreamPort} npm run dev\``,
+    "2. From a Gate checkout, start the connector against this generated config:",
+    "   `go run ./cmd/gate-connector -config <this-project>/gate/connector.yaml`",
+    "3. Point your MCP client at Gate instead of the upstream server:",
+    "   `http://127.0.0.1:7443/mcp`"
+  ];
+  if (hasPolicy) {
+    lines.push(
+      "",
+      "## Generated Policy",
+      "",
+      "The generated `gate/policies/mcp_tool_allowlist.rego` file allowlists the OpenAPI-derived tool names from this project."
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function buildGateToolAllowlistPolicy(toolNames: string[]): string {
+  const approvedTools = [...new Set(toolNames)].sort().map((name) => `\t${JSON.stringify(name)},`);
+  return [
+    "package formal.v2",
+    "",
+    "import rego.v1",
+    "",
+    "default pre_request := {\"action\": \"allow\"}",
+    "",
+    "approved_tools := {",
+    ...approvedTools,
+    "}",
+    "",
+    "pre_request := {",
+    "\t\"action\": \"block\",",
+    "\t\"reason\": sprintf(\"tool %s is not approved for this MCP gateway\", [input.mcp.tool_name]),",
+    "} if {",
+    "\tinput.resource.type == \"mcp\"",
+    "\tinput.mcp.method == \"tools/call\"",
+    "\tnot approved_tools[input.mcp.tool_name]",
+    "}",
+    ""
+  ].join("\n");
 }
 
 function parseArgs(argv: string[]): CliOptions {
