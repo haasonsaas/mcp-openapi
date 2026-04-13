@@ -10,6 +10,8 @@ export interface LintDiagnostic {
 export interface CompileOptions {
   strict?: boolean;
   toolNameTemplate?: string;
+  descriptionFile?: Record<string, string>;
+  toolNameSeparator?: string;
 }
 
 export interface SecurityScheme {
@@ -85,6 +87,8 @@ export interface RuntimeOptions {
   responseTransformModule?: string;
   sseMaxSessions: number;
   sseSessionTtlMs: number;
+  authScopes?: Record<string, string>;
+  policyWebhookUrl?: string;
 }
 
 export interface PaginationSummary {

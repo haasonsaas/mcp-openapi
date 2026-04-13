@@ -1,8 +1,17 @@
 #!/usr/bin/env node
-import { createRequire } from "node:module";
 import { basename, resolve } from "node:path";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile as readFileAsync, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { watch } from "node:fs";
+
+const PKG_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
 import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Hono } from "hono";
@@ -28,9 +37,11 @@ import { zodFromJsonSchema } from "./zod-schema.js";
 import { compileDocumentWithCache } from "./compile-cache.js";
 import { lintOpenApiDocument } from "./lint.js";
 import { loadOpenApiDocument } from "./openapi.js";
+import yaml from "js-yaml";
 
-const require = createRequire(import.meta.url);
-const Ajv = require("ajv");
+import AjvModule from "ajv";
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const Ajv = (AjvModule as any).default ?? AjvModule;
 
 type Validator = ((data: unknown) => boolean) & { errors?: Array<Record<string, unknown>> };
 
@@ -120,12 +131,13 @@ async function main(): Promise<void> {
 
 function createMcpServer(state: RuntimeState, cli: CliOptions): Server {
   const mcpServer = new Server(
-    { name: "mcp-openapi", version: "0.1.0" },
+    { name: "mcp-openapi", version: PKG_VERSION },
     { capabilities: { tools: { listChanged: true }, logging: {} } }
   );
 
   mcpServer.setRequestHandler(ListToolsRequestSchema, async (request) => {
     const sortedTools = [...state.operations.values()]
+      .filter((op) => isToolAllowed(op, cli.runtime))
       .sort((a, b) => a.operationId.localeCompare(b.operationId))
       .map((op) => ({
         name: op.operationId,
@@ -157,6 +169,16 @@ function createMcpServer(state: RuntimeState, cli: CliOptions): Server {
         content: [{ type: "text", text: JSON.stringify({ error: `Tool not allowed by policy: ${operation.operationId}` }, null, 2) }],
         isError: true
       };
+    }
+
+    if (cli.runtime.policyWebhookUrl) {
+      const policyResult = await checkPolicyWebhook(cli.runtime.policyWebhookUrl, operation, request.params.arguments ?? {});
+      if (!policyResult.allow) {
+        return {
+          content: [{ type: "text", text: JSON.stringify({ error: `Denied by policy webhook: ${policyResult.reason ?? "no reason given"}` }, null, 2) }],
+          isError: true
+        };
+      }
     }
 
     const inputZod = state.validators.inputsZod.get(operation.operationId);
@@ -802,6 +824,10 @@ function parseArgs(argv: string[]): CliOptions {
   let printTools = false;
   let validateSpec = false;
   let watchSpec = false;
+  let descriptionsFile: Record<string, string> | undefined;
+  let authScopes: Record<string, string> | undefined;
+  let policyWebhookUrl: string | undefined;
+  let toolNameSeparator: string | undefined;
   let transport: CliOptions["transport"] = "stdio";
   let port = 3000;
   let timeoutMs = 20_000;
@@ -827,7 +853,7 @@ function parseArgs(argv: string[]): CliOptions {
       specPath,
       serverUrl,
       cachePath,
-      compile: { strict, toolNameTemplate },
+      compile: { strict, toolNameTemplate, descriptionFile: descriptionsFile, toolNameSeparator },
       printTools,
       validateSpec,
       watchSpec,
@@ -846,7 +872,9 @@ function parseArgs(argv: string[]): CliOptions {
         allowedPathPrefixes,
         responseTransformModule,
         sseMaxSessions,
-        sseSessionTtlMs
+        sseSessionTtlMs,
+        authScopes,
+        policyWebhookUrl
       }
     };
   }
@@ -957,6 +985,37 @@ function parseArgs(argv: string[]): CliOptions {
       watchSpec = true;
       continue;
     }
+    if (arg === "--descriptions") {
+      const filePath = argv[++i] ?? "";
+      try {
+        const raw = readFileSync(resolve(filePath), "utf8");
+        descriptionsFile = filePath.endsWith(".yaml") || filePath.endsWith(".yml")
+          ? (yaml.load(raw) as Record<string, string>)
+          : (JSON.parse(raw) as Record<string, string>);
+      } catch (err) {
+        throw new Error(`Failed to load descriptions file: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      continue;
+    }
+    if (arg === "--auth-scope") {
+      const raw = argv[++i] ?? "";
+      authScopes = {};
+      for (const pair of raw.split(",")) {
+        const [tag, prefix] = pair.split("=", 2);
+        if (tag && prefix) {
+          authScopes[tag.trim()] = prefix.trim();
+        }
+      }
+      continue;
+    }
+    if (arg === "--policy-webhook") {
+      policyWebhookUrl = argv[++i] ?? "";
+      continue;
+    }
+    if (arg === "--tool-name-separator") {
+      toolNameSeparator = argv[++i] ?? "_";
+      continue;
+    }
     if (arg === "--help" || arg === "-h") {
       printHelp();
       process.exit(0);
@@ -975,7 +1034,7 @@ function parseArgs(argv: string[]): CliOptions {
     specPath,
     serverUrl,
     cachePath,
-    compile: { strict, toolNameTemplate },
+    compile: { strict, toolNameTemplate, descriptionFile: descriptionsFile, toolNameSeparator },
     printTools,
     validateSpec,
     watchSpec,
@@ -994,7 +1053,9 @@ function parseArgs(argv: string[]): CliOptions {
       allowedPathPrefixes,
       responseTransformModule,
       sseMaxSessions,
-      sseSessionTtlMs
+      sseSessionTtlMs,
+      authScopes,
+      policyWebhookUrl
     }
   };
 }
@@ -1055,6 +1116,11 @@ function printHelp(): void {
       "  --sse-max-sessions <n>",
       "  --sse-session-ttl-ms <ms>",
       "",
+      "  --descriptions <file>            JSON/YAML file mapping operationId -> description",
+      "  --auth-scope <mapping>           tag=PREFIX pairs (e.g. governance=GOV,meter=METER)",
+      "  --policy-webhook <url>           URL for policy webhook (fail-closed)",
+      "  --tool-name-separator <char>     separator for tool names (default: _)",
+      "",
       "Auth env vars:",
       "  MCP_OPENAPI_API_KEY",
       "  MCP_OPENAPI_BEARER_TOKEN",
@@ -1066,6 +1132,55 @@ function printHelp(): void {
       "  MCP_OPENAPI_<SCHEME_NAME>_TOKEN"
     ].join("\n") + "\n"
   );
+}
+
+// --- Policy webhook ---
+
+interface PolicyWebhookResult {
+  allow: boolean;
+  reason?: string;
+}
+
+const policyWebhookCache = new Map<string, { result: PolicyWebhookResult; expiresAt: number }>();
+const POLICY_CACHE_TTL_MS = 30_000;
+
+async function checkPolicyWebhook(webhookUrl: string, operation: OperationModel, input: unknown): Promise<PolicyWebhookResult> {
+  const cacheKey = operation.operationId;
+  const cached = policyWebhookCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.result;
+  }
+
+  try {
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        tool: operation.operationId,
+        method: operation.method,
+        path: operation.pathTemplate,
+        input,
+        tags: operation.tags ?? []
+      }),
+      signal: AbortSignal.timeout(5000)
+    });
+
+    if (!response.ok) {
+      return { allow: false, reason: `Policy webhook returned ${response.status}` };
+    }
+
+    const body = await response.json() as Record<string, unknown>;
+    const result: PolicyWebhookResult = {
+      allow: body.allow === true,
+      reason: typeof body.reason === "string" ? body.reason : undefined
+    };
+
+    policyWebhookCache.set(cacheKey, { result, expiresAt: Date.now() + POLICY_CACHE_TTL_MS });
+    return result;
+  } catch (error) {
+    // Fail closed
+    return { allow: false, reason: `Policy webhook unreachable: ${error instanceof Error ? error.message : String(error)}` };
+  }
 }
 
 function isObject(value: unknown): value is object {
