@@ -41,6 +41,7 @@ test("generate command creates project files", async () => {
   assert.match(serverTs, /--spec/);
   assert.match(gateReadme, /Point your MCP client at Gate/);
   assert.match(gateConnector, /protocol: "mcp"/);
+  assert.match(gateConnector, /path: "policies\/mcp_tool_allowlist\.rego"/);
   assert.match(gatePolicy, /approved_tools/);
   assert.match(gatePolicy, /getHealth/);
   assert.match(gatePolicy, /postEcho/);

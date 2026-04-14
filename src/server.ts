@@ -852,7 +852,7 @@ function buildGateConnectorYaml(upstreamPort: number, resourceName: string, hasP
     lines.push(
       "",
       "policies:",
-      "  - path: \"gate/policies/mcp_tool_allowlist.rego\"",
+      "  - path: \"policies/mcp_tool_allowlist.rego\"",
       "    stage: \"pre_request\""
     );
   }
@@ -888,7 +888,8 @@ function buildGateReadme(upstreamPort: number, hasPolicy: boolean): string {
       "",
       "## Generated Policy",
       "",
-      "The generated `gate/policies/mcp_tool_allowlist.rego` file allowlists the OpenAPI-derived tool names from this project."
+      "The generated `gate/policies/mcp_tool_allowlist.rego` file allowlists the OpenAPI-derived tool names from this project.",
+      "Its connector reference is config-relative, so `gate-connector -config <this-project>/gate/connector.yaml` works regardless of your current working directory."
     );
   }
   return `${lines.join("\n")}\n`;
